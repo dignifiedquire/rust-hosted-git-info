@@ -1,0 +1,8 @@
+[package]
+name = "hosted-git-info"
+version = "0.1.0"
+authors = ["Friedel Ziegelmayer <dignifiedquire@gmail.com>"]
+
+[dependencies]
+regex = "0.1"
+url = "1.2.1"
