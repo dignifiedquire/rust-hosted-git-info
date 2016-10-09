@@ -4,7 +4,7 @@ extern crate url;
 use regex::Regex;
 use url::Url;
 
-
+#[derive(Debug, PartialEq)]
 enum Protocol {
     GitSsh,
     GitHttps,
@@ -18,6 +18,10 @@ enum Protocol {
 
 impl Protocol {
     fn from_str(proto: &str) -> Result<Protocol, ()> {
+        if is_shortcut(proto) {
+            return Ok(Protocol::Shortcut);
+        }
+
         match proto {
             "git+ssh"   => Ok(Protocol::GitSsh),
             "git+https" => Ok(Protocol::GitHttps),
@@ -33,7 +37,7 @@ impl Protocol {
     fn to_str(&self) -> &str {
         match *self {
             Protocol::GitSsh   => "sshurl",
-            Protocol::GitHttps => "git+https",
+            Protocol::GitHttps => "https",
             Protocol::GitHttp  => "git+http",
             Protocol::Ssh      => "sshurl",
             Protocol::Https    => "https",
@@ -44,6 +48,7 @@ impl Protocol {
     }
 }
 
+#[derive(Debug, PartialEq)]
 enum Host {
     Github,
     Bitbucket,
@@ -51,27 +56,68 @@ enum Host {
     Gist,
 }
 
-pub struct HostedGit<'a> {
+impl Host {
+    fn into_iter() -> ::std::vec::IntoIter<Host> {
+        vec![
+            Host::Github,
+            Host::Bitbucket,
+            Host::Gitlab,
+            Host::Gist,
+        ].into_iter()
+    }
+
+    fn to_str(&self) -> &str {
+        match *self {
+            Host::Github    => "github",
+            Host::Bitbucket => "bitbucket",
+            Host::Gitlab    => "gitlab",
+            Host::Gist      => "gist",
+        }
+    }
+
+    fn to_string(&self) -> String {
+        self.to_str().to_string()
+    }
+
+    fn from_str(host: &str) -> Result<Host, ()> {
+        match host {
+            "github"    => Ok(Host::Github),
+            "bitbucket" => Ok(Host::Bitbucket),
+            "gitlab"    => Ok(Host::Gitlab),
+            "gist"      => Ok(Host::Gist),
+            _           => Err(()),
+        }
+    }
+
+    fn from_domain(domain: &str) -> Result<Host, ()> {
+        match domain {
+            "github.com"      => Ok(Host::Github),
+            "bitbucket.org"   => Ok(Host::Bitbucket),
+            "gitlab.com"      => Ok(Host::Gitlab),
+            "gist.github.com" => Ok(Host::Gist),
+            _                 => Err(()),
+        }
+    }
+}
+
+#[derive(Debug, PartialEq)]
+pub struct HostedGit {
     host: Host,
-    user: &'a str,
-    auth: &'a str,
-    project: &'a str,
-    committish: &'a str,
+    user: String,
+    password: Option<String>,
+    project: String,
+    committish: Option<String>,
     protocol: Protocol,
 }
 
-impl<'a> HostedGit<'a> {
-    fn parse<'b>(url: &'b str) -> HostedGit {
-        let parsed = GitUrl::parse(url);
-
-        HostedGit {
-            host: Host::Github,
-            user: &"hello",
-            auth: &"world",
-            project: &"cool",
-            committish: &"master",
-            protocol: parsed.protocol,
+impl HostedGit {
+    fn new<S>(url: S) -> HostedGit where S: Into<String> {
+        let url = url.into();
+        if is_git_url(&url) {
+            return parse_git_url(&url);
         }
+
+        parse_regular_url(&url)
     }
 
     fn get_default_representation (&self) -> &str {
@@ -79,48 +125,81 @@ impl<'a> HostedGit<'a> {
     }
 }
 
-struct GitUrl<'a> {
-    protocol: Protocol,
-    host: &'a str,
-    auth: Option<&'a str>,
-    port: Option<u16>,
-    hash: Option<&'a str>,
-    path: &'a str,
+fn git_re () -> Regex {
+    Regex::new(r"^([^@]+)@([^:]+):[/]?((?:[^/]+[/])?[^/]+?)(?:[.]git)?(#.*)?$").unwrap()
 }
 
-impl<'a> GitUrl<'a> {
-    fn parse (url: &str) -> GitUrl {
-        let re = Regex::new(r"^([^@]+)@([^:]+):[/]?((?:[^/]+[/])?[^/]+?)(?:[.]git)?(#.*)?$").unwrap();
+fn is_git_url (url: &str) -> bool {
+    git_re().is_match(url)
+}
 
-        if re.is_match(url) {
-            let cap = re.captures(url).unwrap();
+fn get_shortcut_host (protocol: &str) -> Option<Host> {
+    Host::into_iter()
+    .filter(|h| h.to_str() == protocol)
+    .nth(0)
+}
 
-            GitUrl {
-                protocol: Protocol::GitSsh,
-                host: cap.at(2).unwrap(),
-                auth: cap.at(1),
-                port: None,
-                hash: cap.at(4),
-                path: ("/".to_string() + cap.at(3).unwrap()).as_ref(),
-            }
-        } else {
-            let parsed = Url::parse(url).unwrap();
-            let auth = match parsed.password() {
-                Some(pw) => Some((parsed.username().to_string() + pw).as_ref()),
-                None     => None
-            };
+fn is_shortcut (protocol: &str) -> bool {
+    get_shortcut_host(protocol).is_some()
+}
 
-            GitUrl {
-                protocol: Protocol::from_str(parsed.scheme()).unwrap(),
-                host: parsed.host_str().unwrap(),
-                auth: auth,
-                port: parsed.port(),
-                hash: parsed.query(),
-                path: parsed.path(),
-            }
-        }
+fn parse_git_url (url: &str) -> HostedGit {
+    let cap = git_re().captures(url).unwrap();
+    let (user, password) = parse_auth(cap.at(1).unwrap_or(""));
+
+    HostedGit {
+        host: cap.at(2).map(|h| Host::from_domain(h).unwrap()).unwrap(),
+        user: user.to_string(),
+        password: password.map(|p| p.to_string()),
+        project: path_to_project(cap.at(3).unwrap_or("/")),
+        committish: hash_to_committish(cap.at(4)),
+        protocol: Protocol::GitSsh,
     }
 }
+
+fn parse_auth<'a> (raw: &'a str) -> (&'a str, Option<&'a str>) {
+    let re = Regex::new(r"([^:]+):(.*)").unwrap();
+
+    match re.captures(raw) {
+        Some(auth_cap) => {
+            (auth_cap.at(0).unwrap(), auth_cap.at(1))
+        },
+        None => ("", None),
+    }
+}
+
+fn path_to_project(path: &str) -> String {
+    let re = Regex::new(r"^[/](.*?)(?:[.]git)?$").unwrap();
+    re.replace(path, "$1")
+}
+
+fn hash_to_committish<'a> (hash: Option<&'a str>) -> Option<String> {
+    hash.map(|c| (&c[1..]).to_string())
+}
+
+fn parse_regular_url (url: &str) -> HostedGit {
+    let parsed = Url::parse(url).unwrap();
+    let protocol = Protocol::from_str(parsed.scheme()).unwrap();
+
+    let host = if protocol == Protocol::Shortcut {
+        get_shortcut_host(parsed.scheme()).unwrap()
+    } else {
+        parsed.host_str().map(|h| Host::from_domain(h).unwrap()).unwrap()
+    };
+
+    let user = parsed.username();
+    let password = parsed.password();
+
+    HostedGit {
+        host: host,
+        user: user.to_string(),
+        password: password.map(|p| p.to_string()),
+        project: path_to_project(parsed.path()),
+        committish: hash_to_committish(parsed.query()),
+        protocol: protocol,
+    }
+}
+
 
 #[cfg(test)]
 mod tests {
@@ -128,12 +207,33 @@ mod tests {
 
     #[test]
     fn basics() {
-        assert_eq!(HostedGit::parse("https://github.com/abc/def").get_default_representation(), "https");
-        assert_eq!(HostedGit::parse("ssh://git@github.com/abc/def").get_default_representation(), "sshurl");
-        assert_eq!(HostedGit::parse("git+ssh://git@github.com/abc/def").get_default_representation(), "sshurl");
-        assert_eq!(HostedGit::parse("git+https://github.com/abc/def").get_default_representation(), "https");
-        assert_eq!(HostedGit::parse("git@github.com:abc/def").get_default_representation(), "sshurl");
-        assert_eq!(HostedGit::parse("git://github.com/abc/def").get_default_representation(), "git");
-        assert_eq!(HostedGit::parse("github:abc/def").get_default_representation(), "shortcut");
+        assert_eq!(
+            HostedGit::new("https://github.com/abc/def").get_default_representation(),
+            "https"
+        );
+        assert_eq!(
+            HostedGit::new("ssh://git@github.com/abc/def").get_default_representation(),
+            "sshurl"
+        );
+        assert_eq!(
+            HostedGit::new("git+ssh://git@github.com/abc/def").get_default_representation(),
+            "sshurl"
+        );
+        assert_eq!(
+            HostedGit::new("git+https://github.com/abc/def").get_default_representation(),
+            "https"
+        );
+        assert_eq!(
+            HostedGit::new("git@github.com:abc/def").get_default_representation(),
+            "sshurl"
+        );
+        assert_eq!(
+            HostedGit::new("git://github.com/abc/def").get_default_representation(),
+            "git"
+        );
+        assert_eq!(
+            HostedGit::new("github:abc/def").get_default_representation(),
+            "shortcut"
+        );
     }
 }
